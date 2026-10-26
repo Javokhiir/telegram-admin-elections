@@ -4,7 +4,7 @@ When the owner of a basic group deletes their account or leaves, and nobody else
 
 **Basic groups only, not supergroups.** Supergroups already let an owner transfer ownership and keep their admins when the owner leaves.
 
-▶︎ [Media/demo.mp4](Media/demo.mp4): four flows in 70 seconds, recorded on the iOS app built from this code.
+▶︎ [Media/demo.mp4](Media/demo.mp4): four flows in 76 seconds, recorded on the iOS app built from this code.
 
 ![The group has no admin](Media/01-no-admin-banner.png)
 

@@ -693,10 +693,14 @@ private final class GroupAdminElectionScreenComponent: Component {
                             }
                         },
                         dismiss: { [weak self] in
-                            if let current = self?.electionState?.current, !current.isOpen {
-                                service.dismissResult(peerId: groupId)
-                            }
-                            self?.dismiss(animated: true)
+                            let isFinished = self?.electionState?.current.flatMap({ !$0.isOpen }) ?? false
+                            // Clear the result only once the sheet is gone: clearing it first turns the
+                            // sheet back into the candidate list while it slides away.
+                            self?.dismiss(animated: true, completion: {
+                                if isFinished {
+                                    service.dismissResult(peerId: groupId)
+                                }
+                            })
                         }
                     )),
                     style: .glass,
