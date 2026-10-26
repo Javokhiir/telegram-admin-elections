@@ -1,0 +1,271 @@
+diff --git a/submodules/ChatPresentationInterfaceState/Sources/ChatPresentationInterfaceState.swift b/submodules/ChatPresentationInterfaceState/Sources/ChatPresentationInterfaceState.swift
+index 9602614063..27f8f8cfc5 100644
+--- a/submodules/ChatPresentationInterfaceState/Sources/ChatPresentationInterfaceState.swift
++++ b/submodules/ChatPresentationInterfaceState/Sources/ChatPresentationInterfaceState.swift
+@@ -38,6 +38,7 @@ public enum ChatTitlePanelContext: Equatable, Comparable {
+     case requestInProgress
+     case toastAlert(String)
+     case inviteRequests([EnginePeer], Int32)
++    case adminElection
+     
+     private var index: Int {
+         switch self {
+@@ -49,6 +50,8 @@ public enum ChatTitlePanelContext: Equatable, Comparable {
+                 return 3
+             case .inviteRequests:
+                 return 4
++            case .adminElection:
++                return 5
+         }
+     }
+     
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift
+index 26c32f83be..1755fd11ac 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift
+@@ -787,6 +787,16 @@ public extension TelegramEngine {
+             |> ignoreValues
+         }
+         
++        /// Adds a service message that exists only on this device, for client-side features the
++        /// server does not announce yet.
++        public func addLocalServiceMessage(peerId: EnginePeer.Id, text: String, entities: [MessageTextEntity]) -> Signal<Never, NoError> {
++            return self.account.postbox.transaction { transaction -> Void in
++                let timestamp = Int32(CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970) + Int32(self.account.network.globalTimeDifference)
++                let _ = transaction.addMessages([StoreMessage(peerId: peerId, namespace: Namespaces.Message.Local, customStableId: nil, globallyUniqueId: Int64.random(in: Int64.min ... Int64.max), groupingKey: nil, threadId: nil, timestamp: timestamp, flags: [], tags: [], globalTags: [], localTags: [], forwardInfo: nil, authorId: nil, text: "", attributes: [], media: [TelegramMediaAction(action: .customText(text: text, entities: entities, additionalAttributes: nil))])], location: .Random)
++            }
++            |> ignoreValues
++        }
++        
+         public func storeLocallyDerivedData(messageId: MessageId, data: [String: CodableEntry]) -> Signal<Never, NoError> {
+             return self.account.postbox.transaction { transaction -> Void in
+                 transaction.updateMessage(messageId, update: { currentMessage in
+diff --git a/submodules/TelegramUI/BUILD b/submodules/TelegramUI/BUILD
+index 8873646e6e..e0a6c618af 100644
+--- a/submodules/TelegramUI/BUILD
++++ b/submodules/TelegramUI/BUILD
+@@ -434,6 +434,8 @@ swift_library(
+         "//submodules/MetalEngine",
+         "//submodules/TelegramUI/Components/DustEffect",
+         "//submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen",
++        "//submodules/TelegramUI/Components/GroupAdminElection",
++        "//submodules/TelegramUI/Components/GroupAdminElection:GroupAdminElectionCore",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageSelectionInputPanelNode",
+         "//submodules/TelegramUI/Components/Chat/ChatQrCodeScreen",
+         "//submodules/UIKitRuntimeUtils",
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
+index 4801bd4d38..41983b1ecf 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
+@@ -12,6 +12,7 @@ swift_library(
+     deps = [
+         "//submodules/UrlWhitelist",
+         "//submodules/AccountContext",
++        "//submodules/TelegramUI/Components/GroupAdminElection",
+         "//submodules/LottieSettings:LottieSettings",
+         "//submodules/AccountUtils",
+         "//submodules/ActionSheetPeerItem",
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoMembers.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoMembers.swift
+index d19e07f18f..5d5724206b 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoMembers.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoMembers.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import GroupAdminElection
+ import SwiftSignalKit
+ import Postbox
+ import TelegramCore
+@@ -224,8 +225,18 @@ private final class PeerInfoMembersContextImpl {
+                 }
+             }))
+         } else if peerId.namespace == Namespaces.Peer.CloudGroup {
+-            self.disposable.set((context.account.postbox.peerView(id: peerId)
+-            |> deliverOn(self.queue)).startStrict(next: { [weak self] view in
++            // A member the group elected shows as an admin, see GroupAdminElectionService.
++            let electedAdminId: Signal<PeerId?, NoError> = Signal<GroupAdminElectionService, NoError> { subscriber in
++                subscriber.putNext(GroupAdminElectionService.shared(context: context))
++                subscriber.putCompletion()
++                return EmptyDisposable
++            }
++            |> runOn(.mainQueue())
++            |> mapToSignal { service in
++                return service.electedAdminIdSignal(peerId: peerId)
++            }
++            self.disposable.set((combineLatest(context.account.postbox.peerView(id: peerId), electedAdminId)
++            |> deliverOn(self.queue)).startStrict(next: { [weak self] view, electedAdminId in
+                 guard let strongSelf = self, let cachedData = view.cachedData as? CachedGroupData, let participantsData = cachedData.participants else {
+                     return
+                 }
+@@ -256,7 +267,7 @@ private final class PeerInfoMembersContextImpl {
+                             invitedBy = invitedByValue
+                             rank = rankValue
+                         }
+-                        unsortedMembers.append(.legacyGroupMember(peer: RenderedPeer(peer: peer), role: role, invitedBy: invitedBy, presence: view.peerPresences[participant.peerId] as? TelegramUserPresence, storyStats: view.memberStoryStats[participant.peerId], rank: rank))
++                        unsortedMembers.append(.legacyGroupMember(peer: RenderedPeer(peer: peer), role: participant.peerId == electedAdminId ? .admin : role, invitedBy: invitedBy, presence: view.peerPresences[participant.peerId] as? TelegramUserPresence, storyStats: view.memberStoryStats[participant.peerId], rank: rank))
+                     }
+                 }
+                 
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenOpenMember.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenOpenMember.swift
+index c3ec8b8af4..96e9be40b7 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenOpenMember.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenOpenMember.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import GroupAdminElection
+ import UIKit
+ import Display
+ import AccountContext
+@@ -29,6 +30,27 @@ extension PeerInfoScreenNode {
+             })))
+         }
+         
++        if groupAdminElectionCanOfferProposal(context: self.context, group: enclosingPeer, candidate: member.peer) {
++            items.append(.action(ContextMenuActionItem(text: groupAdminElectionProposalTitle(context: self.context, candidate: member.peer), icon: { theme in generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Promote"), color: theme.contextMenu.primaryColor) }, action: { [weak self] c, _ in
++                c?.dismiss {
++                    guard let self else {
++                        return
++                    }
++                    presentGroupAdminElectionProposal(
++                        context: self.context,
++                        group: enclosingPeer,
++                        candidate: member.peer,
++                        present: { [weak self] controller in
++                            self?.controller?.present(controller, in: .window(.root))
++                        },
++                        push: { [weak self] controller in
++                            self?.controller?.push(controller)
++                        }
++                    )
++                }
++            })))
++        }
++        
+         if actions.contains(.editRank) {
+             let actionTitle: String
+             if case .creator = member.role {
+diff --git a/submodules/TelegramUI/Sources/AppDelegate.swift b/submodules/TelegramUI/Sources/AppDelegate.swift
+index 941074eadb..81b2598f01 100644
+--- a/submodules/TelegramUI/Sources/AppDelegate.swift
++++ b/submodules/TelegramUI/Sources/AppDelegate.swift
+@@ -60,6 +60,7 @@ import AlertComponent
+ import AppCenter
+ import AppCenterCrashes
+ #endif
++import GroupAdminElection
+ 
+ private let handleVoipNotifications = false
+ 
+@@ -347,6 +348,7 @@ private func extractAccountManagerState(records: AccountRecordsView<TelegramAcco
+     private var recaptchaClientsBySiteKey: [String: Promise<RecaptchaClient>] = [:]
+         
+     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
++        GroupAdminElectionDemoTouches.installIfEnabled()
+         precondition(!testIsLaunched)
+         testIsLaunched = true
+         
+diff --git a/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift b/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
+index a017f153f8..b5ba74ec9f 100644
+--- a/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
++++ b/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
+@@ -28,6 +28,8 @@ import TelegramCallsUI
+ import TelegramNotices
+ import GameUI
+ import ScreenCaptureDetection
++import GroupAdminElection
++import GroupAdminElectionCore
+ import GalleryUI
+ import OpenInExternalAppUI
+ import LegacyUI
+@@ -5523,6 +5525,40 @@ extension ChatControllerImpl {
+             hasActiveCalls = .single(false)
+         }
+         
++        self.adminElectionDisposable?.dispose()
++        if case let .peer(peerId) = self.chatLocation, peerId.namespace == Namespaces.Peer.CloudGroup {
++            self.adminElectionDisposable = (GroupAdminElectionService.shared(context: self.context).state(peerId: peerId)
++            |> map { state -> Bool in
++                return state != nil
++            }
++            |> distinctUntilChanged
++            |> deliverOnMainQueue).startStrict(next: { [weak self] isActive in
++                self?.updateChatPresentationInterfaceState(animated: true, interactive: false, { state in
++                    return state.updatedTitlePanelContext { contexts in
++                        var contexts = contexts.filter { $0 != .adminElection }
++                        if isActive {
++                            contexts.append(.adminElection)
++                        }
++                        return contexts.sorted()
++                    }
++                })
++            })
++            
++            self.adminElectionOutcomeDisposable?.dispose()
++            self.adminElectionOutcomeDisposable = (GroupAdminElectionService.shared(context: self.context).outcomes
++            |> filter { $0.0 == peerId }
++            |> deliverOnMainQueue).startStrict(next: { [weak self] _, election in
++                guard let self, case .elected = election.outcome else {
++                    return
++                }
++                let service = GroupAdminElectionService.shared(context: self.context)
++                guard !service.isScreenVisible(peerId: peerId), isTopmostChatController(self), let peer = self.presentationInterfaceState.renderedPeer?.peer else {
++                    return
++                }
++                self.push(GroupAdminElectionScreen(context: self.context, group: EnginePeer(peer), celebrate: true))
++            })
++        }
++        
+         let shouldBeActive = combineLatest(self.context.sharedContext.mediaManager.audioSession.isPlaybackActive() |> deliverOnMainQueue, historyNode.hasVisiblePlayableItemNodes, hasActiveCalls)
+         |> mapToSignal { [weak self] isPlaybackActive, hasVisiblePlayableItemNodes, hasActiveCalls -> Signal<Bool, NoError> in
+             if hasVisiblePlayableItemNodes && !isPlaybackActive && !hasActiveCalls {
+diff --git a/submodules/TelegramUI/Sources/ChatController.swift b/submodules/TelegramUI/Sources/ChatController.swift
+index 88472a6044..460bba91f2 100644
+--- a/submodules/TelegramUI/Sources/ChatController.swift
++++ b/submodules/TelegramUI/Sources/ChatController.swift
+@@ -333,6 +333,8 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+     var clearCacheDisposable: MetaDisposable?
+     var bankCardDisposable: MetaDisposable?
+     var hasActiveGroupCallDisposable: Disposable?
++    var adminElectionDisposable: Disposable?
++    var adminElectionOutcomeDisposable: Disposable?
+     var sendAsPeersDisposable: Disposable?
+     var preloadAttachBotIconsDisposables: DisposableSet?
+     var keepMessageCountersSyncrhonizedDisposable: Disposable?
+@@ -7083,6 +7085,8 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+         }
+ 
+         self.historyStateDisposable?.dispose()
++        self.adminElectionDisposable?.dispose()
++        self.adminElectionOutcomeDisposable?.dispose()
+         self.messageIndexDisposable.dispose()
+         self.navigationActionDisposable.dispose()
+         self.galleryHiddenMesageAndMediaDisposable.dispose()
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceTitlePanelNodes.swift b/submodules/TelegramUI/Sources/ChatInterfaceTitlePanelNodes.swift
+index 2b5cf5eb0d..4f9452d0ba 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceTitlePanelNodes.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceTitlePanelNodes.swift
+@@ -92,7 +92,7 @@ func titlePanelForChatPresentationInterfaceState(_ chatPresentationInterfaceStat
+                             break loop
+                         }
+                     }
+-                case .requestInProgress, .toastAlert, .inviteRequests:
++                case .requestInProgress, .toastAlert, .inviteRequests, .adminElection:
+                     selectedContext = context
+                     break loop
+             }
+@@ -214,6 +214,16 @@ func titlePanelForChatPresentationInterfaceState(_ chatPresentationInterfaceStat
+                     panel.interfaceInteraction = interfaceInteraction
+                     return panel
+                 }
++            case .adminElection:
++                if let peerId = chatPresentationInterfaceState.renderedPeer?.peerId {
++                    if let currentPanel = currentPanel as? ChatAdminElectionTitlePanelNode, currentPanel.peerId == peerId {
++                        return currentPanel
++                    } else {
++                        let panel = ChatAdminElectionTitlePanelNode(context: context, peerId: peerId)
++                        panel.interfaceInteraction = interfaceInteraction
++                        return panel
++                    }
++                }
+             case let .inviteRequests(peers, count):
+                 if let peerId = chatPresentationInterfaceState.renderedPeer?.peerId {
+                     if let currentPanel = currentPanel as? ChatInviteRequestsTitlePanelNode {
